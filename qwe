@@ -1,0 +1,41 @@
+补丁 1：my/grandient_conflict_monitor.py
+在 _gradnorm_adjust_weights 函数内，第 368 行附近，找：
+
+    _gradnorm_ema_weights = dict(adjusted)  # 保存 EMA 状态供下一步使用
+    return adjusted
+改成：
+
+    _gradnorm_ema_weights = dict(adjusted)  # 保存 EMA 状态供下一步使用
+    # ── 关键：将调整后的权重暴露给 aux_task_plugin.forward 读取 ──
+    # plugin.forward 在 LLM forward 时就用静态 task_weights 算好了 weighted_aux_loss，
+    # 把 EMA 权重写到 builtins，plugin.forward 下次调用时读取并覆盖 task_weights，
+    # GradNorm 对辅助任务的权重调整才能真正作用于反传 loss。
+    builtins._GRADNORM_TASK_WEIGHTS = dict(adjusted)
+    return adjusted
+只加 3 行有效代码（其余是注释）。
+
+📝 补丁 2：my/plugin.py
+在 attach_auxiliary_modules 内部的 patched forward 函数里，第 495-498 行附近，找：
+
+        aux_features = {'hidden_states': hidden_states}
+        task_weights = {
+            task: _get_task_train_weight(self.aux_head_config['tasks'][task]) for task in active_tasks
+        }
+        aux_state['task_weights'] = task_weights
+改成：
+
+        aux_features = {'hidden_states': hidden_states}
+        task_weights = {
+            task: _get_task_train_weight(self.aux_head_config['tasks'][task]) for task in active_tasks
+        }
+        # ── 关键：读取 GradNorm 在上一个 monitor step 调整好的 EMA 权重 ──
+        # 由 gradient_conflict_monitor.py 的 _gradnorm_adjust_weights 写入 builtins。
+        # 没启用 GradNorm 时该变量不存在，task_weights 保持配置文件的静态值。
+        import builtins as _bi
+        _ema_weights = getattr(_bi, '_GRADNORM_TASK_WEIGHTS', None)
+        if _ema_weights:
+            for _t in list(task_weights.keys()):
+                if _t in _ema_weights:
+                    task_weights[_t] = float(_ema_weights[_t])
+        aux_state['task_weights'] = task_weights
+只加 6 行有效代码（其余是注释）。
